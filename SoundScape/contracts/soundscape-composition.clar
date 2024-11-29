@@ -9,6 +9,9 @@
 (define-constant err-max-supply (err u103))
 (define-constant err-invalid-payment (err u104))
 (define-constant err-element-exists (err u105))
+(define-constant err-invalid-price (err u106))
+(define-constant err-invalid-max-supply (err u107))
+(define-constant err-invalid-parameter (err u108))
 
 ;; Define NFT token
 (define-non-fungible-token soundscape uint)
@@ -59,21 +62,51 @@
     uint
 )
 
+;; Constants for validation
+(define-constant min-price u1000000) ;; 1 STX minimum
+(define-constant max-price u1000000000) ;; 1000 STX maximum
+(define-constant min-supply u100)
+(define-constant max-supply-limit u10000)
+
 ;; Administrative Functions
 (define-public (set-mint-price (new-price uint))
     (begin
         (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        ;; Validate price range
+        (asserts! (and (>= new-price min-price) (<= new-price max-price)) err-invalid-price)
         (ok (var-set mint-price new-price))))
 
 (define-public (set-max-supply (new-max uint))
     (begin
         (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        ;; Validate supply range
+        (asserts! (and (>= new-max min-supply) (<= new-max max-supply-limit)) err-invalid-parameter)
         (ok (var-set max-supply new-max))))
 
 (define-public (add-contributor (artist principal))
     (begin
         (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        ;; Check if address is not null and not already a contributor
+        (asserts! (and 
+            (not (is-eq artist contract-owner))
+            (not (default-to false (map-get? contributors artist)))) 
+            err-invalid-parameter)
         (ok (map-set contributors artist true))))
+
+;; Helper function for string validation
+(define-private (validate-string (str (string-ascii 256)))
+    (let ((len (len str)))
+        (and (> len u0) (< len u256))))
+
+;; Helper function for musical parameters validation
+(define-private (validate-musical-params 
+    (bpm uint)
+    (duration uint)
+    (rarity uint))
+    (and 
+        (and (>= bpm u20) (<= bpm u300))  ;; Valid BPM range
+        (and (> duration u0) (<= duration u600))  ;; Max 10 minutes
+        (and (>= rarity u1) (<= rarity u100))))  ;; Rarity percentage
 
 ;; Artist Contribution Functions
 (define-public (add-musical-element
@@ -86,27 +119,50 @@
     (duration uint)
     (rarity uint)
     (uri (string-ascii 256)))
-    (let ((element-id (default-to u0 (map-get? element-counts element-type))))
-        (asserts! (default-to false (map-get? contributors tx-sender)) err-invalid-contributor)
-        (ok (begin
-            (map-set musical-elements
-                {element-type: element-type, element-id: element-id}
-                {
-                    artist: tx-sender,
-                    name: name,
-                    genre: genre,
-                    mood: mood,
-                    bpm: bpm,
-                    key: key,
-                    duration: duration,
-                    rarity: rarity,
-                    uri: uri
-                })
-            (map-set element-counts element-type (+ element-id u1))))))
+    (let ((element-id (default-to u0 (map-get? element-counts element-type))))  ;; Removed incorrect ]
+        (begin
+            ;; Validate contributor
+            (asserts! (default-to false (map-get? contributors tx-sender)) err-invalid-contributor)
+            ;; Validate strings
+            (asserts! (and 
+                (validate-string element-type)
+                (validate-string name)
+                (validate-string genre)
+                (validate-string mood)
+                (validate-string key)
+                (validate-string uri)) err-invalid-parameter)
+            ;; Validate musical parameters
+            (asserts! (validate-musical-params bpm duration rarity) err-invalid-parameter)
+            ;; Check if element type is valid
+            (asserts! (or 
+                (is-eq element-type "melody")
+                (is-eq element-type "harmony")
+                (is-eq element-type "rhythm")
+                (is-eq element-type "effects")) err-invalid-parameter)
+            (ok (begin
+                (map-set musical-elements
+                    {element-type: element-type, element-id: element-id}
+                    {
+                        artist: tx-sender,
+                        name: name,
+                        genre: genre,
+                        mood: mood,
+                        bpm: bpm,
+                        key: key,
+                        duration: duration,
+                        rarity: rarity,
+                        uri: uri
+                    })
+                (map-set element-counts element-type (+ element-id u1)))))))
 
 ;; Generation Functions
 (define-private (get-random (seed uint) (max uint))
-    (mod (buff-to-uint (sha256 (uint-to-buff seed))) max))
+    (let (
+        (hash (sha256 (concat 
+                    (unwrap-panic (to-consensus-buff? (var-get last-token-id)))
+                    (unwrap-panic (to-consensus-buff? block-height)))))
+        (hash-16 (unwrap-panic (as-max-len? (unwrap-panic (slice? hash u0 u16)) u16))))
+        (mod (buff-to-uint-be hash-16) max)))
 
 (define-private (generate-composition (seed uint))
     (let (
@@ -129,7 +185,7 @@
         (begin
             ;; Implementation would distribute royalties to contributing artists
             ;; Based on element usage in the composition
-            (ok true))))
+            (ok royalty-amount))))
 
 (define-public (mint)
     (let (
@@ -140,7 +196,7 @@
         
         ;; Mint NFT and store composition
         (try! (nft-mint? soundscape token-id tx-sender))
-        (try! (distribute-royalties (var-get mint-price)))
+        (unwrap-panic (distribute-royalties (var-get mint-price))) ;; Changed from try! to unwrap-panic
         (map-set compositions token-id composition)
         (var-set last-token-id token-id)
         (ok token-id)))
@@ -157,8 +213,7 @@
 
 (define-read-only (get-composition-details (token-id uint))
     (match (map-get? compositions token-id)
-        composition
-        (ok {
+        composition (ok {
             melody: (get-musical-element "melody" (get melody composition)),
             harmony: (get-musical-element "harmony" (get harmony composition)),
             rhythm: (get-musical-element "rhythm" (get rhythm composition)),
@@ -166,16 +221,4 @@
             seed: (get seed composition),
             timestamp: (get timestamp composition)
         })
-        err-not-found))
-
-(define-read-only (is-contributor (address principal))
-    (default-to false (map-get? contributors address)))
-
-(define-read-only (get-mint-price)
-    (var-get mint-price))
-
-(define-read-only (get-max-supply)
-    (var-get max-supply))
-
-(define-read-only (get-current-supply)
-    (var-get last-token-id))
+        (err err-not-found)))
